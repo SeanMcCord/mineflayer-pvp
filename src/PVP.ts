@@ -1,211 +1,211 @@
-import { Bot } from "mineflayer";
-import { Movements, Pathfinder, goals } from "mineflayer-pathfinder";
-import { Entity } from "prismarine-entity";
-import { MaxDamageOffset, TimingSolver } from "./TimingSolver";
-import { TaskQueue } from 'mineflayer-utils';
+import {Bot} from "mineflayer";
+import {goals, Movements, Pathfinder} from "mineflayer-pathfinder";
+import {Entity} from "prismarine-entity";
+import {equipBestWeapon} from './Quartermaster';
+import {TaskQueue} from './TaskQueue';
+import {MaxDamageOffset, TimingSolver} from "./TimingSolver";
 
 /**
  * The main pvp manager plugin class.
  */
-export class PVP
-{
-    private readonly bot: Bot;
-    private timeToNextAttack: number = 0;
-    private wasInRange: boolean = false;
+export class PVP {
+  private readonly bot: Bot;
+  private timeToNextAttack: number = 0;
+  private wasInRange: boolean = false;
 
-    /**
-     * The current target. This value should never be assigned to from outside the plugin.
-     */
-    target?: Entity;
+  /**
+   * The current target. This value should never be assigned to from outside the plugin.
+   */
+  target?: Entity;
 
-    /**
-     * The movements object to pass to pathfinder when creating the follow entity goal. Assign
-     * to null in order to avoid passing any movement config to pathfinder. (If you plan on using
-     * your own)
-     */
-    movements?: Movements;
+  targetVanquanshed?: any;
 
-    /**
-     * How close the bot will attempt to get to the target when when pursuing it.
-     */
-    followRange: number = 2;
+  /**
+   * The movements object to pass to pathfinder when creating the follow entity goal. Assign
+   * to null in order to avoid passing any movement config to pathfinder. (If you plan on using
+   * your own)
+   */
+  movements?: Movements;
 
-    /**
-     * How far away the target entity must be to lose the target. Target entities further than this
-     * distance from the bot will be considered defeated.
-     */
-    viewDistance: number = 128;
+  // TODO: maybe prevent the bot from getting into the hitbox of the entity?
+  /**
+   * How close the bot will attempt to get to the target when when pursuing it.
+   */
+  followRange: number = 2;
 
-    /**
-     * How close must the bot be to the target in order to try attacking it.
-     */
-    attackRange: number = 3.5;
+  /**
+   * How far away the target entity must be to lose the target. Target entities further than this
+   * distance from the bot will be considered defeated.
+   */
+  viewDistance: number = 128;
 
-    /**
-     * The timing solver to use when deciding how long to wait before preforming another attack
-     * after finishing an attack.
-     * 
-     * // TODO Check for 'hasAtttackCooldown' feature. If feature not present, default to RandomTicks solver.
-     */
-    meleeAttackRate: TimingSolver = new MaxDamageOffset();
+  /**
+   * How close must the bot be to the target in order to try attacking it.
+   */
+  attackRange: number = 3.5;
 
-    /**
-     * Creates a new instance of the PVP plugin.
-     * 
-     * @param bot - The bot this plugin is being attached to.
-     */
-    constructor(bot: Bot)
-    {
-        this.bot = bot;
-        this.movements = new Movements(bot, require('minecraft-data')(bot.version));
+  /**
+   * The timing solver to use when deciding how long to wait before preforming another attack
+   * after finishing an attack.
+   * 
+   * // TODO Check for 'hasAtttackCooldown' feature. If feature not present, default to RandomTicks solver.
+   */
+  meleeAttackRate: TimingSolver = new MaxDamageOffset();
 
-        this.bot.on('physicTick', () => this.update());
-        this.bot.on('entityGone', e => { if (e === this.target) this.stop(); })
+  /**
+   * Creates a new instance of the PVP plugin.
+   * 
+   * @param bot - The bot this plugin is being attached to.
+   */
+  constructor(bot: Bot) {
+    this.bot = bot;
+    this.movements = new Movements(bot, require('minecraft-data')(bot.version));
+
+    this.bot.on('physicTick', () => this.update());
+    this.bot.on('entityGone', e => {if (e === this.target) this.stop();})
+  }
+
+  /**
+   * Causes the bot to begin attacking an entity until it is killed or told to stop.
+   * 
+   * @param target - The target to attack.
+   */
+  attack(target: Entity): Promise<void> | undefined {
+    if (target === this.target) return;
+
+    this.stop();
+    this.target = target;
+    this.timeToNextAttack = 0;
+
+    if (!this.target) return;
+
+    // @ts-expect-error
+    const pathfinder: Pathfinder = this.bot.pathfinder;
+    if (this.movements) pathfinder.setMovements(this.movements);
+
+    pathfinder.setGoal(new goals.GoalFollow(this.target, this.followRange), true);
+
+    // @ts-expect-error
+    this.bot.emit('startedAttacking');
+
+    return new Promise<void>((resolve, _) => {
+      this.targetVanquanshed = resolve;
+    });
+  }
+
+  /**
+   * Stops attacking the current entity.
+   */
+  stop(): void {
+    if (this.target == null) return
+
+    if (this.targetVanquanshed != null) this.targetVanquanshed();
+
+    this.target = undefined;
+
+    // @ts-expect-error
+    const pathfinder: Pathfinder = this.bot.pathfinder;
+    // @ts-expect-error Not in typescript definition, yet.
+    pathfinder.setGoal(null);
+
+    // @ts-expect-error
+    this.bot.emit('stoppedAttacking');
+  }
+
+  /**
+   * Called each tick to update attack timers.
+   */
+  private update(): void {
+    this.checkRange();
+
+    if (!this.target) return;
+
+    this.timeToNextAttack--;
+    if (this.timeToNextAttack === -1)
+      this.attemptAttack();
+  }
+
+  /**
+   * Updates whether the bot is in attack range of the target or not.
+   */
+  private checkRange(): void {
+    if (!this.target) return;
+    if (this.timeToNextAttack < 0) return;
+
+    const dist = this.target.position.distanceTo(this.bot.entity.position);
+
+    if (dist > this.viewDistance) {
+      this.stop();
+      return;
     }
 
-    /**
-     * Causes the bot to begin attacking an entity until it is killed or told to stop.
-     * 
-     * @param target - The target to attack.
-     */
-    attack(target: Entity): void
-    {
-        if (target === this.target) return;
+    const inRange = dist <= this.attackRange;
 
-        this.stop();
-        this.target = target;
-        this.timeToNextAttack = 0;
+    if (!this.wasInRange && inRange)
+      this.timeToNextAttack = 0;
 
-        if (!this.target) return;
+    this.wasInRange = inRange;
+  }
 
-        // @ts-expect-error
-        const pathfinder: Pathfinder = this.bot.pathfinder;
-        if (this.movements) pathfinder.setMovements(this.movements);
+  /**
+   * Attempts to preform an attack on the target.
+   */
+  private attemptAttack() {
+    if (!this.target) return;
 
-        pathfinder.setGoal(new goals.GoalFollow(this.target, this.followRange), true);
-
-        // @ts-expect-error
-        this.bot.emit('startedAttacking');
+    if (!this.wasInRange) {
+      this.timeToNextAttack = this.meleeAttackRate.getTicks(this.bot);
+      return;
     }
 
-    /**
-     * Stops attacking the current entity.
-     */
-    stop(): void
-    {
-        if (this.target == null) return
+    const queue = new TaskQueue()
+    const target = this.target;
+    const shield = this.hasShield();
 
-        this.target = undefined;
-
-        // @ts-expect-error
-        const pathfinder: Pathfinder = this.bot.pathfinder;
-        // @ts-expect-error Not in typescript definition, yet.
-        pathfinder.setGoal(null);
-
-        // @ts-expect-error
-        this.bot.emit('stoppedAttacking');
+    if (shield) {
+      queue.addSync(() => this.bot.deactivateItem())
+      queue.add(cb => setTimeout(cb, 100))
     }
 
-    /**
-     * Called each tick to update attack timers.
-     */
-    private update(): void
-    {
-        this.checkRange();
+    queue.add(cb => {
+      if (target !== this.target) throw 'Target changed!';
+      this.bot.lookAt(this.target.position.offset(0, this.target.height, 0), true, cb)
+    });
 
-        if (!this.target) return;
+    queue.addSync(() => {
+      if (target !== this.target) throw 'Target changed!';
+      // TODO: await this to ensure the weapon is equiped.
+      equipBestWeapon(this.bot, this.target);
+      this.bot.attack(this.target);
 
-        this.timeToNextAttack--;
-        if (this.timeToNextAttack === -1)
-            this.attemptAttack();
+      // @ts-expect-error
+      this.bot.emit('attackedTarget');
+    });
+
+    if (shield) {
+      queue.add(cb => setTimeout(cb, 150))
+      queue.addSync(() => {
+        if (target !== this.target) throw 'Target changed!';
+        if (this.hasShield())
+          this.bot.activateItem(true)
+      })
     }
 
-    /**
-     * Updates whether the bot is in attack range of the target or not.
-     */
-    private checkRange(): void
-    {
-        if (!this.target) return;
-        if (this.timeToNextAttack < 0) return;
+    queue.runAll((err: Error | undefined) => {
+      if (!err)
+        this.timeToNextAttack = this.meleeAttackRate.getTicks(this.bot);
+    });
+  }
 
-        const dist = this.target.position.distanceTo(this.bot.entity.position);
+  /**
+   * Check if the bot currently has a shield equipped.
+   */
+  private hasShield(): boolean {
+    if (this.bot.supportFeature('doesntHaveOffHandSlot')) return false;
 
-        if (dist > this.viewDistance)
-        {
-            this.stop();
-            return;
-        }
+    const slot = this.bot.inventory.slots[this.bot.getEquipmentDestSlot('off-hand')];
+    if (!slot) return false;
 
-        const inRange = dist <= this.attackRange;
-
-        if (!this.wasInRange && inRange)
-            this.timeToNextAttack = 0;
-
-        this.wasInRange = inRange;
-    }
-
-    /**
-     * Attempts to preform an attack on the target.
-     */
-    private attemptAttack()
-    {
-        if (!this.target) return;
-
-        if (!this.wasInRange)
-        {
-            this.timeToNextAttack = this.meleeAttackRate.getTicks(this.bot);
-            return;
-        }
-
-        const queue = new TaskQueue()
-        const target = this.target;
-        const shield = this.hasShield();
-
-        if (shield)
-        {
-            queue.addSync(() => this.bot.deactivateItem())
-            queue.add(cb => setTimeout(cb, 100))
-        }
-            
-        queue.add(cb => {
-            if (target !== this.target) throw 'Target changed!';
-            this.bot.lookAt(this.target.position.offset(0, this.target.height, 0), true, cb)
-        });
-
-        queue.addSync(() => {
-            if (target !== this.target) throw 'Target changed!';
-            this.bot.attack(this.target);
-
-            // @ts-expect-error
-            this.bot.emit('attackedTarget');
-        });
-
-        if (shield)
-        {
-            queue.add(cb => setTimeout(cb, 150))
-            queue.addSync(() => {
-                if (target !== this.target) throw 'Target changed!';
-                if (this.hasShield())
-                    this.bot.activateItem(true)
-            })
-        }
-
-        queue.runAll((err) => {
-            if (!err)
-                this.timeToNextAttack = this.meleeAttackRate.getTicks(this.bot);
-        });
-    }
-
-    /**
-     * Check if the bot currently has a shield equipped.
-     */
-    private hasShield(): boolean
-    {
-        if (this.bot.supportFeature('doesntHaveOffHandSlot')) return false;
-
-        const slot = this.bot.inventory.slots[this.bot.getEquipmentDestSlot('off-hand')];
-        if (!slot) return false;
-    
-        return slot.name.includes('shield');
-    }
+    return slot.name.includes('shield');
+  }
 }
